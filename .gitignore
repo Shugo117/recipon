@@ -1,0 +1,21 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# DB（本番では使わない前提）
+*.db
+
+# Python build
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
