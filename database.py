@@ -1,7 +1,7 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-print("### DB URL =", DATABASE_URL)
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./recipon.db")
 
 # Renderのpostgres:// を修正
@@ -15,6 +15,7 @@ if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
 
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
+print("### DB URL =", DATABASE_URL)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
