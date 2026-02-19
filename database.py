@@ -1,7 +1,7 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-
+print("### DB URL =", DATABASE_URL)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./recipon.db")
 
 # Renderのpostgres:// を修正
