@@ -12,6 +12,7 @@ import re
 import ipaddress
 import socket
 import urllib.request
+import json
 
 from database import SessionLocal, engine, Base
 from models import RecipeLink
@@ -201,7 +202,139 @@ def get_og_image(page_url: str) -> Optional[str]:
 
 
 # =========================
-# Dish name (og:title etc.)
+# Dish name extraction helpers
+# =========================
+_NOISE_WORDS = [
+    "レシピ", "作り方", "簡単", "人気", "おすすめ", "献立", "材料", "手順", "動画",
+    "プロの", "定番", "料理", "キッチン",
+]
+
+_SPLIT_SEP_RE = re.compile(r"\s*(?:[｜|]|[-–—]|:|：|／|/)\s*")
+
+_TAIL_RE = re.compile(
+    r"\s*(?:by\s+\S+|By\s+\S+|【[^】]{1,40}】|\([^)]{1,40}\)|（[^）]{1,40}）)\s*$"
+)
+
+def clean_dish_title(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+
+    s = re.sub(r"\s+", " ", (raw or "")).strip()
+    if not s:
+        return None
+
+    # まず「右側に付くサイト名」を切る
+    s = _SPLIT_SEP_RE.split(s)[0].strip()
+
+    # 末尾の括弧系を軽く複数回落とす
+    for _ in range(2):
+        ns = _TAIL_RE.sub("", s).strip()
+        if ns == s:
+            break
+        s = ns
+
+    # よくある語尾・語頭を落とす
+    s = re.sub(r"レシピ$", "", s).strip()
+    s = re.sub(r"^レシピ[:：]?\s*", "", s).strip()
+    s = re.sub(r"作り方$", "", s).strip()
+    s = re.sub(r"^作り方[:：]?\s*", "", s).strip()
+
+    # ノイズワード（先頭/末尾だけ）を落とす
+    for w in _NOISE_WORDS:
+        s = re.sub(rf"^{re.escape(w)}\s*", "", s).strip()
+        s = re.sub(rf"\s*{re.escape(w)}$", "", s).strip()
+
+    # 末尾に付きがちな「〜さん」「〜のレシピ」系を雑に削る（破壊しすぎない程度）
+    s = re.sub(r"\s+(さん|ちゃん|くん|氏)$", "", s).strip()
+
+    # 記号整理
+    s = s.strip(" -–—|｜:：/／").strip()
+
+    if 2 <= len(s) <= 60:
+        return s
+    return None
+
+
+def extract_recipe_name_from_jsonld(html: str) -> Optional[str]:
+    # <script type="application/ld+json"> ... </script> を全部拾う
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        blob = (m.group(1) or "").strip()
+        if not blob:
+            continue
+        try:
+            data = json.loads(blob)
+        except Exception:
+            continue
+
+        candidates: List[dict] = []
+        if isinstance(data, dict):
+            candidates.append(data)
+            g = data.get("@graph")
+            if isinstance(g, list):
+                candidates.extend([x for x in g if isinstance(x, dict)])
+        elif isinstance(data, list):
+            candidates.extend([x for x in data if isinstance(x, dict)])
+
+        for obj in candidates:
+            t = obj.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if any(isinstance(x, str) and x == "Recipe" for x in types):
+                name = obj.get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+
+    return None
+
+
+def extract_og_or_title(html: str) -> Optional[str]:
+    # og:title
+    m = re.search(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        html,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+            html,
+            flags=re.IGNORECASE,
+        )
+
+    # twitter:title
+    if not m:
+        m = re.search(
+            r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']',
+            html,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            m = re.search(
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:title["\']',
+                html,
+                flags=re.IGNORECASE,
+            )
+
+    if m:
+        t = (m.group(1) or "").strip()
+        if t:
+            return t
+
+    # <title>
+    mt = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if mt:
+        t = re.sub(r"\s+", " ", (mt.group(1) or "").strip())
+        if t:
+            return t
+
+    return None
+
+
+# =========================
+# Dish name (JSON-LD -> og:title -> <title>)
 # =========================
 @lru_cache(maxsize=512)
 def get_og_title(page_url: str) -> Optional[str]:
@@ -223,54 +356,23 @@ def get_og_title(page_url: str) -> Optional[str]:
             ctype = (res.headers.get("Content-Type") or "").lower()
             if "text/html" not in ctype:
                 return None
-            raw = res.read(220_000)
+            raw = res.read(240_000)
             html = raw.decode("utf-8", errors="ignore")
 
-        m = re.search(
-            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
-            html,
-            flags=re.IGNORECASE,
-        )
-        if not m:
-            m = re.search(
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
-                html,
-                flags=re.IGNORECASE,
-            )
+        # 1) JSON-LD (Recipe.name)
+        title = extract_recipe_name_from_jsonld(html)
 
-        if not m:
-            m = re.search(
-                r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']',
-                html,
-                flags=re.IGNORECASE,
-            )
-            if not m:
-                m = re.search(
-                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:title["\']',
-                    html,
-                    flags=re.IGNORECASE,
-                )
-
-        title = None
-        if m:
-            title = (m.group(1) or "").strip()
-
+        # 2) OGP / twitter / title
         if not title:
-            mt = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-            if mt:
-                title = re.sub(r"\s+", " ", (mt.group(1) or "").strip())
+            title = extract_og_or_title(html)
 
-        if not title:
-            return None
+        # 3) Clean
+        cleaned = clean_dish_title(title or "")
+        if cleaned:
+            return cleaned
 
-        # サイト名を落とす（簡易）
-        parts = re.split(r"\s*[｜|]\s*|\s*[-–—]\s*", title)
-        if parts:
-            cand = (parts[0] or "").strip()
-            if 2 <= len(cand) <= 80:
-                return cand
-
-        title = title.strip()
+        # fallback
+        title = (title or "").strip()
         if 2 <= len(title) <= 80:
             return title
         return None
@@ -349,7 +451,7 @@ def index(
     edit_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    print("### INDEX HIT / app.py version = 2026-02-20-LONGPRESS-DELETE-PWA ###")
+    print("### INDEX HIT / app.py version = 2026-02-20-JSONLD-CLEAN-TITLE-PWA ###")
 
     filter_category = normalize_category(category) if category else None
     if category and filter_category == "その他" and category not in CATEGORY_KEYS:
